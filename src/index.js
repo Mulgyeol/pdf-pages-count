@@ -27,6 +27,13 @@ function countPdfPagesSync(input) {
   } catch (_) {
     // ignore and fallback
   }
+  // Try xref stream path (PDF 1.5+)
+  try {
+    const pageCount2 = parsePageCountViaXrefStream(buffer);
+    if (Number.isInteger(pageCount2) && pageCount2 > 0) return pageCount2;
+  } catch (_) {
+    // ignore and fallback
+  }
   // Fallback: scan for /Type /Pages with /Count N and take max
   let count = scanMaxPagesCount(buffer);
   if (count > 0) return count;
@@ -384,8 +391,8 @@ function scanMaxPagesCount(buffer) {
   let m;
   while ((m = typePagesRe.exec(s)) !== null) {
     // Search forward a window for '/Count N'
-    const windowStart = m.index;
-    const windowEnd = Math.min(s.length, windowStart + 5000);
+    const windowStart = Math.max(0, m.index - 1024);
+    const windowEnd = Math.min(s.length, m.index + 50000);
     const window = s.slice(windowStart, windowEnd);
     const cm = window.match(/\/Count\s+(\d+)/);
     if (cm) {
@@ -428,17 +435,21 @@ function scanMaxPagesCountFromObjectStreams(buffer) {
     const hasFlate = /FlateDecode/.test(dictString);
     if (hasFlate) {
       let dataStart = streamIdx + "stream".length;
-      // Skip EOL after 'stream'
-      if (buffer[dataStart] === 0x0d && buffer[dataStart + 1] === 0x0a)
-        dataStart += 2; // CRLF
-      else if (buffer[dataStart] === 0x0a) dataStart += 1; // LF
+      // Skip whitespace/EOL after 'stream'
+      while (
+        buffer[dataStart] === 0x20 ||
+        buffer[dataStart] === 0x0d ||
+        buffer[dataStart] === 0x0a
+      ) {
+        dataStart += 1;
+      }
 
       const endStreamIdx = s.indexOf("endstream", dataStart);
       if (endStreamIdx !== -1) {
         const dataEnd = endStreamIdx;
         const streamBuf = buffer.slice(dataStart, dataEnd);
-        // Skip very large streams to keep it fast (~5MB cap)
-        if (streamBuf.length > 0 && streamBuf.length <= 5 * 1024 * 1024) {
+        // Skip very large streams to keep it fast (~10MB cap)
+        if (streamBuf.length > 0 && streamBuf.length <= 10 * 1024 * 1024) {
           try {
             const inflated = zlib.inflateSync(streamBuf);
             const text = inflated.toString("latin1");
@@ -446,8 +457,8 @@ function scanMaxPagesCountFromObjectStreams(buffer) {
             const typePagesRe = /\/Type\s*\/Pages\b/g;
             let mm;
             while ((mm = typePagesRe.exec(text)) !== null) {
-              const winStart = mm.index;
-              const winEnd = Math.min(text.length, winStart + 5000);
+              const winStart = Math.max(0, mm.index - 1024);
+              const winEnd = Math.min(text.length, mm.index + 50000);
               const window = text.slice(winStart, winEnd);
               const cm = window.match(/\/Count\s+(\d+)/);
               if (cm) {
@@ -507,14 +518,18 @@ function scanDeflatedStreamsForPattern(buffer, regexGlobal) {
     }
     if (/FlateDecode/.test(dictString)) {
       let dataStart = streamIdx + "stream".length;
-      if (buffer[dataStart] === 0x0d && buffer[dataStart + 1] === 0x0a)
-        dataStart += 2;
-      else if (buffer[dataStart] === 0x0a) dataStart += 1;
+      while (
+        buffer[dataStart] === 0x20 ||
+        buffer[dataStart] === 0x0d ||
+        buffer[dataStart] === 0x0a
+      ) {
+        dataStart += 1;
+      }
       const endStreamIdx = s.indexOf("endstream", dataStart);
       if (endStreamIdx !== -1) {
         const dataEnd = endStreamIdx;
         const blen = dataEnd - dataStart;
-        if (blen > 0 && blen <= 5 * 1024 * 1024) {
+        if (blen > 0 && blen <= 10 * 1024 * 1024) {
           try {
             const inflated = zlib.inflateSync(buffer.slice(dataStart, dataEnd));
             const text = inflated.toString("latin1");
@@ -528,4 +543,182 @@ function scanDeflatedStreamsForPattern(buffer, regexGlobal) {
     pos = streamIdx + "stream".length;
   }
   return hits;
+}
+
+// ---------------- XRef Stream Path -----------------
+function parsePageCountViaXrefStream(buffer) {
+  const startXrefPos = findStartXref(buffer);
+  if (startXrefPos < 0) throw new Error("startxref not found");
+  const xrefOffset = parseStartXrefOffset(buffer, startXrefPos);
+  if (
+    !Number.isFinite(xrefOffset) ||
+    xrefOffset <= 0 ||
+    xrefOffset >= buffer.length
+  ) {
+    throw new Error("Invalid xref offset");
+  }
+  const xrefObj = readStreamObject(buffer, xrefOffset);
+  if (!/\/Type\s*\/XRef\b/.test(xrefObj.dictString))
+    throw new Error("Not an XRef stream");
+  const rootRef = parseIndirectRefFromDict(xrefObj.dictString, "Root");
+  if (!rootRef) throw new Error("Root not in XRef trailer");
+
+  const xmap = buildXrefMapFromXrefStream(xrefObj);
+  const catalogDict = getObjectDictViaXrefMap(
+    buffer,
+    xmap,
+    rootRef.obj,
+    rootRef.gen
+  );
+  const pagesRef = parseIndirectRefFromDict(catalogDict, "Pages");
+  if (!pagesRef) throw new Error("Pages ref not in Catalog");
+  const pagesDict = getObjectDictViaXrefMap(
+    buffer,
+    xmap,
+    pagesRef.obj,
+    pagesRef.gen
+  );
+  const count = parseIntFromDict(pagesDict, "Count");
+  if (!Number.isInteger(count) || count <= 0)
+    throw new Error("Count not found");
+  return count;
+}
+
+function readStreamObject(buffer, offset) {
+  let pos = offset;
+  const headerLine = readLineAscii(buffer, pos).trim();
+  const m = headerLine.match(/^(\d+)\s+(\d+)\s+obj\b/);
+  if (!m) throw new Error("Invalid object header");
+  pos = advanceToNextLine(buffer, pos);
+  pos = skipWhitespace(buffer, pos);
+  if (!(buffer[pos] === 0x3c && buffer[pos + 1] === 0x3c))
+    throw new Error("Object dictionary not found");
+  const { dictString, endPos } = readDictString(buffer, pos);
+  let p = endPos;
+  // find 'stream'
+  const idx = buffer.indexOf(Buffer.from("stream"), p);
+  if (idx === -1) throw new Error("stream keyword not found");
+  let dataStart = idx + "stream".length;
+  while (
+    buffer[dataStart] === 0x20 ||
+    buffer[dataStart] === 0x0d ||
+    buffer[dataStart] === 0x0a
+  )
+    dataStart += 1;
+  const endIdx = buffer.indexOf(Buffer.from("endstream"), dataStart);
+  if (endIdx === -1) throw new Error("endstream not found");
+  const streamBuffer = buffer.slice(dataStart, endIdx);
+  return { dictString, streamBuffer };
+}
+
+function readWArray(dictString) {
+  const m = dictString.match(/\/W\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s*\]/);
+  if (!m) throw new Error("W array not found");
+  return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+}
+
+function readIndexArray(dictString, size) {
+  const m = dictString.match(/\/Index\s*\[(.*?)\]/);
+  if (!m) return [0, size];
+  const nums = m[1]
+    .trim()
+    .split(/\s+/)
+    .map((t) => parseInt(t, 10))
+    .filter((n) => Number.isFinite(n));
+  const out = [];
+  for (let i = 0; i + 1 < nums.length; i += 2) out.push(nums[i], nums[i + 1]);
+  return out.length ? out : [0, size];
+}
+
+function readSize(dictString) {
+  const m = dictString.match(/\/Size\s+(\d+)/);
+  if (!m) throw new Error("Size not found");
+  return parseInt(m[1], 10);
+}
+
+function buildXrefMapFromXrefStream(xrefObj) {
+  const size = readSize(xrefObj.dictString);
+  const [w0, w1, w2] = readWArray(xrefObj.dictString);
+  const index = readIndexArray(xrefObj.dictString, size);
+  const data = xrefObj.streamBuffer;
+  const objToOffset = new Map();
+  const objToObjStm = new Map(); // obj -> { objstm, index }
+  let p = 0;
+  for (let i = 0; i < index.length; i += 2) {
+    const objStart = index[i];
+    const count = index[i + 1];
+    for (let j = 0; j < count; j += 1) {
+      const type = readUIntBE(data, p, w0);
+      p += w0;
+      const f2 = readUIntBE(data, p, w1);
+      p += w1; // offset or objstm
+      const f3 = readUIntBE(data, p, w2);
+      p += w2; // gen or index
+      const objNum = objStart + j;
+      const t = w0 === 0 ? 1 : type; // default type 1 when w0==0
+      if (t === 1) {
+        objToOffset.set(objNum, { offset: f2, gen: f3 });
+      } else if (t === 2) {
+        objToObjStm.set(objNum, { objstm: f2, index: f3 });
+      }
+    }
+  }
+  return { objToOffset, objToObjStm };
+}
+
+function readUIntBE(buf, pos, len) {
+  if (len === 0) return 0;
+  let n = 0;
+  for (let i = 0; i < len; i += 1) n = (n << 8) | (buf[pos + i] || 0);
+  return n >>> 0;
+}
+
+function getObjectDictViaXrefMap(buffer, xmap, objNum, gen) {
+  const off = xmap.objToOffset.get(objNum);
+  if (off && Number.isFinite(off.offset)) {
+    const obj = readIndirectObject(buffer, off.offset, objNum, off.gen);
+    return obj.dictString;
+  }
+  const os = xmap.objToObjStm.get(objNum);
+  if (!os) throw new Error("Object not found in xref map");
+  // Load object stream
+  const osLoc = xmap.objToOffset.get(os.objstm);
+  if (!osLoc) throw new Error("Object stream location not found");
+  const osObj = readStreamObject(buffer, osLoc.offset);
+  if (!/\/Type\s*\/ObjStm\b/.test(osObj.dictString))
+    throw new Error("Not an ObjStm");
+  const nVal = parseIntFromDict(osObj.dictString, "N");
+  const firstVal = parseIntFromDict(osObj.dictString, "First");
+  if (!Number.isInteger(nVal) || !Number.isInteger(firstVal))
+    throw new Error("ObjStm N/First missing");
+  let inflated;
+  try {
+    inflated = zlib.inflateSync(osObj.streamBuffer);
+  } catch (e) {
+    throw new Error("Failed to inflate ObjStm");
+  }
+  const txt = inflated.toString("latin1");
+  // Header: N pairs of "objNum offset"
+  const headerPart = txt.slice(0, firstVal);
+  const nums = headerPart
+    .trim()
+    .split(/\s+/)
+    .map((t) => parseInt(t, 10));
+  const pairs = [];
+  for (let i = 0; i + 1 < nums.length; i += 2)
+    pairs.push({ obj: nums[i], off: nums[i + 1] });
+  const entry = pairs[os.index];
+  if (!entry) throw new Error("ObjStm index out of range");
+  const start = firstVal + entry.off;
+  const nextOff =
+    os.index + 1 < pairs.length
+      ? firstVal + pairs[os.index + 1].off
+      : inflated.length;
+  const slice = inflated.slice(start, nextOff);
+  // Extract dictionary from slice
+  const b = Buffer.from(slice);
+  const dictStart = b.indexOf(Buffer.from("<<"));
+  if (dictStart === -1) throw new Error("Dict not found in embedded object");
+  const { dictString } = readDictString(b, dictStart);
+  return dictString;
 }
