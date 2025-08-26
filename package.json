@@ -1,0 +1,60 @@
+{
+  "name": "pdf-pages-count",
+  "version": "1.0.0",
+  "description": "Fast PDF total page count extractor (no external deps)",
+  "main": "src/index.js",
+  "module": "src/index.mjs",
+  "exports": {
+    ".": {
+      "require": "./src/index.js",
+      "import": "./src/index.mjs",
+      "types": "./src/index.d.ts"
+    }
+  },
+  "types": "./src/index.d.ts",
+  "keywords": [
+    "pdf",
+    "pages",
+    "page",
+    "count",
+    "pagecount",
+    "page-count",
+    "pdf-page-count",
+    "pdf-pages-count",
+    "pdf-page-counter",
+    "pdf-metadata",
+    "pdf-utils",
+    "pdf-tools"
+  ],
+  "homepage": "https://github.com/Mulgyeol/pdf-pages-count",
+  "bugs": {
+    "url": "https://github.com/Mulgyeol/pdf-pages-count/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Mulgyeol/pdf-pages-count.git"
+  },
+  "author": {
+    "name": "Mulgyeol",
+    "email": "mulgyeoljung@gmail.com",
+    "url": "https://github.com/Mulgyeol"
+  },
+  "sideEffects": false,
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "example": "node examples/cli.js",
+    "example:sync": "node examples/cli.js --sync",
+    "example:batch": "node examples/batch.js"
+  }
+}
