@@ -8,9 +8,9 @@ const zlib = require("zlib");
  * 1) Classic xref parse: startxref -> xref table -> trailer /Root -> Catalog /Pages -> Pages /Count
  * 2) Fallback scan: find "/Type /Pages" objects and take the max /Count
  *
- * Note: XRef streams (object streams) are not yet parsed here; for such files
- * the fallback scanner typically still succeeds. A dedicated XRef stream parser
- * can be added later without changing the public API.
+ * This library supports both classic xref tables and xref streams (incl. object
+ * streams). It prioritizes accurate page-tree traversal; fast fallbacks are used
+ * only if traversal is unavailable.
  */
 
 /**
@@ -20,35 +20,46 @@ const zlib = require("zlib");
  */
 function countPdfPagesSync(input) {
   const buffer = loadToBufferSync(input);
-  // Try fast path via classic xref
+  // 1) Accurate: traverse page tree via XRef stream (modern PDFs)
   try {
-    const pageCount = parsePageCountViaClassicXref(buffer);
-    if (Number.isInteger(pageCount) && pageCount > 0) return pageCount;
-  } catch (_) {
-    // ignore and fallback
-  }
-  // Try xref stream path (PDF 1.5+)
+    const n = countPagesViaXrefStreamTraversal(buffer);
+    if (Number.isInteger(n) && n > 0) return n;
+  } catch (_) {}
+  // 2) Accurate: traverse page tree via classic xref table
   try {
-    const pageCount2 = parsePageCountViaXrefStream(buffer);
-    if (Number.isInteger(pageCount2) && pageCount2 > 0) return pageCount2;
-  } catch (_) {
-    // ignore and fallback
-  }
-  // Fallback: scan for /Type /Pages with /Count N and take max
+    const n = countPagesViaClassicTraversal(buffer);
+    if (Number.isInteger(n) && n > 0) return n;
+  } catch (_) {}
+  // 3) Fast: read /Count via classic xref; guard with heuristic to avoid undercount
+  try {
+    const n = parsePageCountViaClassicXref(buffer);
+    if (Number.isInteger(n) && n > 0) {
+      const approx = countPagesByPageObjects(buffer);
+      return approx > n ? approx : n;
+    }
+  } catch (_) {}
+  // 4) Fast: read /Count via XRef stream; guard with heuristic
+  try {
+    const n = parsePageCountViaXrefStream(buffer);
+    if (Number.isInteger(n) && n > 0) {
+      const approx = countPagesByPageObjects(buffer);
+      return approx > n ? approx : n;
+    }
+  } catch (_) {}
+  // 5) Fallback scans
   let count = scanMaxPagesCount(buffer);
   if (count > 0) return count;
-  // Extra fallback: decompress Flate streams (e.g., ObjStm) and scan inside
   count = scanMaxPagesCountFromObjectStreams(buffer);
   if (count > 0) return count;
-  // Last resort: count /Type /Page occurrences (including in deflated streams)
   count = countPagesByPageObjects(buffer);
-  return count;
+  if (count > 0) return count;
+  throw new Error("PDF page count not found");
 }
 
 /**
  * Public API: countPdfPages (async)
  * @param {string|Buffer|Uint8Array} input - File path or Buffer-like
- * @returns {Promise<number>}
+ * @returns {Promise<number>} Resolves to total number of pages; rejects if not found
  */
 async function countPdfPages(input) {
   if (typeof input === "string") {
@@ -545,6 +556,344 @@ function scanDeflatedStreamsForPattern(buffer, regexGlobal) {
   return hits;
 }
 
+// -------- Accurate traversal using classic xref table --------
+function countPagesViaClassicTraversal(buffer) {
+  const startXrefPos = findStartXref(buffer);
+  if (startXrefPos < 0) throw new Error("startxref not found");
+  const xrefOffset = parseStartXrefOffset(buffer, startXrefPos);
+  if (
+    !Number.isFinite(xrefOffset) ||
+    xrefOffset <= 0 ||
+    xrefOffset >= buffer.length
+  ) {
+    throw new Error("Invalid xref offset");
+  }
+
+  const { objectOffsets, latestTrailerDict } =
+    buildClassicXrefOffsetsFollowingPrevChain(buffer, xrefOffset);
+  const rootRef = parseIndirectRefFromDict(latestTrailerDict, "Root");
+  if (!rootRef) throw new Error("Root not found");
+  return traversePageTreeWithMap(buffer, objectOffsets, rootRef);
+}
+
+// -------- Accurate traversal using xref stream --------
+function countPagesViaXrefStreamTraversal(buffer) {
+  const startXrefPos = findStartXref(buffer);
+  if (startXrefPos < 0) throw new Error("startxref not found");
+  const xrefOffset = parseStartXrefOffset(buffer, startXrefPos);
+  const xrefObj = readStreamObject(buffer, xrefOffset);
+  if (!/\/Type\s*\/XRef\b/.test(xrefObj.dictString))
+    throw new Error("Not XRef stream");
+  const rootRef = parseIndirectRefFromDict(xrefObj.dictString, "Root");
+  if (!rootRef) throw new Error("Root not found in trailer");
+  const xmap = buildXrefMapFromXrefStreamChain(buffer, xrefObj);
+  return traversePageTreeWithXrefStream(buffer, xmap, rootRef);
+}
+
+function traversePageTreeWithMap(buffer, objOffsets, rootRef) {
+  const catalogEntry = objOffsets.get(rootRef.obj);
+  if (!catalogEntry) throw new Error("Catalog not found");
+  const catalog = readIndirectObject(
+    buffer,
+    catalogEntry.offset,
+    rootRef.obj,
+    rootRef.gen
+  );
+  const pagesRef = parseIndirectRefFromDict(catalog.dictString, "Pages");
+  if (!pagesRef) throw new Error("Pages not found");
+  return traversePagesNodeMap(buffer, objOffsets, pagesRef);
+}
+
+function traversePagesNodeMap(buffer, objOffsets, nodeRef) {
+  const entry = objOffsets.get(nodeRef.obj);
+  if (!entry) throw new Error("Node not found");
+  const obj = readIndirectObject(
+    buffer,
+    entry.offset,
+    nodeRef.obj,
+    nodeRef.gen
+  );
+  const dict = obj.dictString;
+  if (/\/Type\s*\/Page\b/.test(dict)) return 1;
+  if (!/\/Type\s*\/Pages\b/.test(dict)) return 0;
+  // Prefer /Count if present and positive
+  const cnt = parseIntFromDict(dict, "Count");
+  let kids = parseKidsArray(dict);
+  if (!kids.length) {
+    const kidsRef = parseIndirectRefFromDict(dict, "Kids");
+    if (kidsRef) {
+      const arrStr = getArrayContentViaOffsets(
+        buffer,
+        objOffsets,
+        kidsRef.obj,
+        kidsRef.gen
+      );
+      kids = parseKidsArrayFromArrayString(arrStr);
+    }
+  }
+  if (!kids.length) return Number.isInteger(cnt) && cnt > 0 ? cnt : 0;
+  let sum = 0;
+  for (const k of kids) {
+    const childEntry = objOffsets.get(k.obj);
+    if (!childEntry) continue;
+    const childObj = readIndirectObject(
+      buffer,
+      childEntry.offset,
+      k.obj,
+      k.gen
+    );
+    const cdict = childObj.dictString;
+    if (/\/Type\s*\/Page\b/.test(cdict)) sum += 1;
+    else if (/\/Type\s*\/Pages\b/.test(cdict)) {
+      const cRef = { obj: k.obj, gen: k.gen };
+      sum += traversePagesNodeMap(buffer, objOffsets, cRef);
+    }
+  }
+  return sum || (Number.isInteger(cnt) && cnt > 0 ? cnt : 0);
+}
+
+function traversePageTreeWithXrefStream(buffer, xmap, rootRef) {
+  const catalogDict = getObjectDictViaXrefMap(
+    buffer,
+    xmap,
+    rootRef.obj,
+    rootRef.gen
+  );
+  const pagesRef = parseIndirectRefFromDict(catalogDict, "Pages");
+  if (!pagesRef) throw new Error("Pages not found");
+  return traversePagesNodeXref(buffer, xmap, pagesRef);
+}
+
+function traversePagesNodeXref(buffer, xmap, nodeRef) {
+  const dict = getObjectDictViaXrefMap(buffer, xmap, nodeRef.obj, nodeRef.gen);
+  if (/\/Type\s*\/Page\b/.test(dict)) return 1;
+  if (!/\/Type\s*\/Pages\b/.test(dict)) return 0;
+  const cnt = parseIntFromDict(dict, "Count");
+  let kids = parseKidsArray(dict);
+  if (!kids.length) {
+    const kidsRef = parseIndirectRefFromDict(dict, "Kids");
+    if (kidsRef) {
+      const arrStr = getObjectContentViaXrefMap(
+        buffer,
+        xmap,
+        kidsRef.obj,
+        kidsRef.gen
+      );
+      kids = parseKidsArrayFromArrayString(arrStr);
+    }
+  }
+  if (!kids.length) return Number.isInteger(cnt) && cnt > 0 ? cnt : 0;
+  let sum = 0;
+  for (const k of kids) {
+    const cdict = getObjectDictViaXrefMap(buffer, xmap, k.obj, k.gen);
+    if (/\/Type\s*\/Page\b/.test(cdict)) sum += 1;
+    else if (/\/Type\s*\/Pages\b/.test(cdict))
+      sum += traversePagesNodeXref(buffer, xmap, k);
+  }
+  return sum || (Number.isInteger(cnt) && cnt > 0 ? cnt : 0);
+}
+
+function getObjectContentViaXrefMap(buffer, xmap, objNum, gen) {
+  const off = xmap.objToOffset.get(objNum);
+  if (off && Number.isFinite(off.offset)) {
+    return readAnyObjectContent(buffer, off.offset, objNum, off.gen);
+  }
+  const os = xmap.objToObjStm.get(objNum);
+  if (!os) throw new Error("Object not found in xref map");
+  const osLoc = xmap.objToOffset.get(os.objstm);
+  if (!osLoc) throw new Error("Object stream location not found");
+  const osObj = readStreamObject(buffer, osLoc.offset);
+  let inflated;
+  try {
+    inflated = zlib.inflateSync(osObj.streamBuffer);
+  } catch (e) {
+    throw new Error("Failed to inflate ObjStm");
+  }
+  const txt = inflated.toString("latin1");
+  const headerPart = txt.slice(0, parseIntFromDict(osObj.dictString, "First"));
+  const nums = headerPart
+    .trim()
+    .split(/\s+/)
+    .map((t) => parseInt(t, 10));
+  const pairs = [];
+  for (let i = 0; i + 1 < nums.length; i += 2)
+    pairs.push({ obj: nums[i], off: nums[i + 1] });
+  const entry = pairs[os.index];
+  if (!entry) throw new Error("ObjStm index out of range");
+  const start = parseIntFromDict(osObj.dictString, "First") + entry.off;
+  const nextOff =
+    os.index + 1 < pairs.length
+      ? parseIntFromDict(osObj.dictString, "First") + pairs[os.index + 1].off
+      : inflated.length;
+  const slice = inflated.slice(start, nextOff);
+  return Buffer.from(slice).toString("latin1");
+}
+
+function parseKidsArray(dictString) {
+  const m = dictString.match(/\/Kids\s*\[(.*?)\]/s);
+  if (!m) return [];
+  const t = m[1];
+  const re = /(\d+)\s+(\d+)\s+R/g;
+  const out = [];
+  let mm;
+  while ((mm = re.exec(t)) !== null)
+    out.push({ obj: parseInt(mm[1], 10), gen: parseInt(mm[2], 10) });
+  return out;
+}
+
+function parseKidsArrayFromArrayString(arrayString) {
+  if (!arrayString) return [];
+  const re = /(\d+)\s+(\d+)\s+R/g;
+  const out = [];
+  let mm;
+  while ((mm = re.exec(arrayString)) !== null) {
+    out.push({ obj: parseInt(mm[1], 10), gen: parseInt(mm[2], 10) });
+  }
+  return out;
+}
+
+function readArrayString(buffer, pos) {
+  if (buffer[pos] !== 0x5b) throw new Error("Expected [");
+  let depth = 0;
+  let p = pos;
+  while (p < buffer.length) {
+    const c = buffer[p++];
+    if (c === 0x5b) depth += 1; // [
+    else if (c === 0x5d) {
+      // ]
+      depth -= 1;
+      if (depth === 0) break;
+    }
+  }
+  return { arrayString: buffer.toString("latin1", pos, p), endPos: p };
+}
+
+function readAnyObjectContent(buffer, offset, expectedObj, expectedGen) {
+  let pos = offset;
+  const headerLine = readLineAscii(buffer, pos).trim();
+  const m = headerLine.match(/^(\d+)\s+(\d+)\s+obj\b/);
+  if (!m) throw new Error("Invalid object header");
+  pos = advanceToNextLine(buffer, pos);
+  pos = skipWhitespace(buffer, pos);
+  const c = buffer[pos];
+  if (c === 0x3c && buffer[pos + 1] === 0x3c) {
+    const { dictString } = readDictString(buffer, pos);
+    return dictString;
+  }
+  if (c === 0x5b) {
+    const { arrayString } = readArrayString(buffer, pos);
+    return `[${arrayString}`;
+  }
+  // Fallback: read until endobj
+  const endIdx = buffer.indexOf(Buffer.from("endobj"), pos);
+  return buffer.toString(
+    "latin1",
+    pos,
+    endIdx > 0 ? endIdx : Math.min(buffer.length, pos + 4096)
+  );
+}
+
+function getArrayContentViaOffsets(buffer, objOffsets, objNum, gen) {
+  const entry = objOffsets.get(objNum);
+  if (!entry) throw new Error("Array object not found");
+  const content = readAnyObjectContent(buffer, entry.offset, objNum, gen);
+  return content;
+}
+
+// Build classic xref object offset map following trailer /Prev chain
+function buildClassicXrefOffsetsFollowingPrevChain(buffer, startOffset) {
+  const objectOffsets = new Map();
+  let trailerDictString = "";
+  let offset = startOffset;
+  let hops = 0;
+  while (offset > 0 && hops < 10) {
+    const token = readAscii(buffer, offset, 4);
+    if (token !== "xref") break;
+    let pos = offset + 4;
+    pos = skipWhitespace(buffer, pos);
+    while (pos < buffer.length) {
+      if (peekKeyword(buffer, pos, "trailer")) break;
+      const header = readLineAscii(buffer, pos);
+      if (!header) break;
+      const parts = header.trim().split(/\s+/);
+      if (parts.length < 2) break;
+      const firstObj = parseInt(parts[0], 10);
+      const count = parseInt(parts[1], 10);
+      pos = advanceToNextLine(buffer, pos);
+      for (let i = 0; i < count; i += 1) {
+        const line = readLineAscii(buffer, pos);
+        const m = line && line.match(/^(\d{10})\s+(\d{5})\s+([nf])/);
+        if (m && m[3] === "n") {
+          const objNum = firstObj + i;
+          if (!objectOffsets.has(objNum)) {
+            objectOffsets.set(objNum, {
+              offset: parseInt(m[1], 10),
+              gen: parseInt(m[2], 10),
+            });
+          }
+        }
+        pos = advanceToNextLine(buffer, pos);
+      }
+      pos = skipWhitespace(buffer, pos);
+    }
+    if (!peekKeyword(buffer, pos, "trailer")) break;
+    pos += "trailer".length;
+    pos = skipWhitespace(buffer, pos);
+    if (!(buffer[pos] === 0x3c && buffer[pos + 1] === 0x3c)) break;
+    const { dictString } = readDictString(buffer, pos);
+    trailerDictString = trailerDictString || dictString; // keep latest (first loop)
+    const prev = parseIntFromDict(dictString, "Prev");
+    if (!Number.isFinite(prev) || prev <= 0 || prev >= buffer.length) break;
+    offset = prev;
+    hops += 1;
+  }
+  if (!trailerDictString) throw new Error("No trailer found");
+  return { objectOffsets, latestTrailerDict: trailerDictString };
+}
+
+// Build xref map by following /Prev chain, supporting both xref streams and classic xref tables in previous revisions
+function buildXrefMapFromXrefStreamChain(buffer, firstXrefObj) {
+  let merged = buildXrefMapFromXrefStream(firstXrefObj);
+  let dict = firstXrefObj.dictString;
+  let prev = parseIntFromDict(dict, "Prev");
+  let hops = 0;
+  while (
+    Number.isFinite(prev) &&
+    prev > 0 &&
+    prev < buffer.length &&
+    hops < 10
+  ) {
+    // Decide whether prev points to classic xref or xref stream
+    const token = readAscii(buffer, prev, 4);
+    if (token === "xref") {
+      // Parse classic and merge
+      const { objectOffsets } = buildClassicXrefOffsetsFollowingPrevChain(
+        buffer,
+        prev
+      );
+      for (const [obj, val] of objectOffsets.entries()) {
+        if (!merged.objToOffset.has(obj)) merged.objToOffset.set(obj, val);
+      }
+      break; // classic chain will internally follow further Prev
+    } else {
+      // Treat as xref stream
+      const xo = readStreamObject(buffer, prev);
+      if (!/\/Type\s*\/XRef\b/.test(xo.dictString)) break;
+      const map = buildXrefMapFromXrefStream(xo);
+      // merge: keep latest (first) wins
+      for (const [obj, val] of map.objToOffset.entries()) {
+        if (!merged.objToOffset.has(obj)) merged.objToOffset.set(obj, val);
+      }
+      for (const [obj, val] of map.objToObjStm.entries()) {
+        if (!merged.objToObjStm.has(obj)) merged.objToObjStm.set(obj, val);
+      }
+      dict = xo.dictString;
+      prev = parseIntFromDict(dict, "Prev");
+      hops += 1;
+    }
+  }
+  return merged;
+}
 // ---------------- XRef Stream Path -----------------
 function parsePageCountViaXrefStream(buffer) {
   const startXrefPos = findStartXref(buffer);
@@ -640,7 +989,15 @@ function buildXrefMapFromXrefStream(xrefObj) {
   const size = readSize(xrefObj.dictString);
   const [w0, w1, w2] = readWArray(xrefObj.dictString);
   const index = readIndexArray(xrefObj.dictString, size);
-  const data = xrefObj.streamBuffer;
+  let data = xrefObj.streamBuffer;
+  if (/FlateDecode/.test(xrefObj.dictString)) {
+    data = zlib.inflateSync(data);
+    const dp = parseDecodeParms(xrefObj.dictString);
+    if (dp && dp.predictor && dp.predictor >= 10) {
+      const columns = dp.columns && dp.columns > 0 ? dp.columns : w0 + w1 + w2;
+      data = pngPredictorDecode(data, columns);
+    }
+  }
   const objToOffset = new Map();
   const objToObjStm = new Map(); // obj -> { objstm, index }
   let p = 0;
@@ -664,6 +1021,65 @@ function buildXrefMapFromXrefStream(xrefObj) {
     }
   }
   return { objToOffset, objToObjStm };
+}
+
+function parseDecodeParms(dictString) {
+  const m = dictString.match(/\/DecodeParms\s*<<([^>]*)>>/s);
+  if (!m) return null;
+  const s = m[1];
+  const predM = s.match(/\/Predictor\s+(\d+)/);
+  const colsM = s.match(/\/Columns\s+(\d+)/);
+  return {
+    predictor: predM ? parseInt(predM[1], 10) : null,
+    columns: colsM ? parseInt(colsM[1], 10) : null,
+  };
+}
+
+function pngPredictorDecode(buf, columns) {
+  // PNG Up/Sub/Average/Paeth on rows of given columns; each row starts with filter byte
+  const rowSize = columns;
+  const out = Buffer.alloc(buf.length); // max
+  let inPos = 0;
+  let outPos = 0;
+  let prevRowStart = -1;
+  while (inPos < buf.length) {
+    const filter = buf[inPos++];
+    if (inPos + rowSize > buf.length) break;
+    // copy row to temp
+    for (let i = 0; i < rowSize; i += 1) {
+      let x = buf[inPos + i] | 0;
+      const left = i > 0 ? out[outPos + i - 1] : 0;
+      const up = prevRowStart >= 0 ? out[prevRowStart + i] : 0;
+      if (filter === 0) {
+        // None
+      } else if (filter === 1) {
+        // Sub
+        x = (x + left) & 255;
+      } else if (filter === 2) {
+        // Up
+        x = (x + up) & 255;
+      } else if (filter === 3) {
+        // Average
+        x = (x + Math.floor((left + up) / 2)) & 255;
+      } else if (filter === 4) {
+        // Paeth
+        const a = left,
+          b = up,
+          c = prevRowStart >= 0 && i > 0 ? out[prevRowStart + i - 1] : 0;
+        const p = a + b - c;
+        const pa = Math.abs(p - a);
+        const pb = Math.abs(p - b);
+        const pc = Math.abs(p - c);
+        const pr = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+        x = (x + pr) & 255;
+      }
+      out[outPos + i] = x;
+    }
+    prevRowStart = outPos;
+    outPos += rowSize;
+    inPos += rowSize;
+  }
+  return out.slice(0, outPos);
 }
 
 function readUIntBE(buf, pos, len) {
